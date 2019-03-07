@@ -9,7 +9,6 @@
 
 export const enableUserTimingAPI = __DEV__;
 
-export const enableHooks = false;
 // Helps identify side effects in begin-phase lifecycle hooks and setState reducers:
 export const debugRenderPhaseSideEffects = false;
 
@@ -52,3 +51,7 @@ export const disableInputAttributeSyncing = false;
 export const enableStableConcurrentModeAPIs = false;
 
 export const warnAboutShorthandPropertyCollision = false;
+
+// See https://github.com/react-native-community/discussions-and-proposals/issues/72 for more information
+// This is a flag so we can fix warnings in RN core before turning it on
+export const warnAboutDeprecatedSetNativeProps = false;

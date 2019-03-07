@@ -20,16 +20,12 @@ import {
   warnForStyleProps,
 } from './NativeMethodsMixinUtils';
 import {create, diff} from './ReactNativeAttributePayload';
-import {
-  now as ReactNativeFrameSchedulingNow,
-  cancelDeferredCallback as ReactNativeFrameSchedulingCancelDeferredCallback,
-  scheduleDeferredCallback as ReactNativeFrameSchedulingScheduleDeferredCallback,
-  shouldYield as ReactNativeFrameSchedulingShouldYield,
-} from './ReactNativeFrameScheduling';
 import {get as getViewConfigForType} from 'ReactNativeViewConfigRegistry';
 
 import deepFreezeAndThrowOnMutationInDev from 'deepFreezeAndThrowOnMutationInDev';
 import invariant from 'shared/invariant';
+import warningWithoutStack from 'shared/warningWithoutStack';
+import {warnAboutDeprecatedSetNativeProps} from 'shared/ReactFeatureFlags';
 
 import {dispatchEvent} from './ReactFabricEventEmitter';
 
@@ -140,6 +136,15 @@ class ReactFabricHostComponent {
 
   setNativeProps(nativeProps: Object) {
     if (__DEV__) {
+      if (warnAboutDeprecatedSetNativeProps) {
+        warningWithoutStack(
+          false,
+          'Warning: Calling ref.setNativeProps(nativeProps) ' +
+            'is deprecated and will be removed in a future release. ' +
+            'Use the setNativeProps export from the react-native package instead.' +
+            "\n\timport {setNativeProps} from 'react-native';\n\tsetNativeProps(ref, nativeProps);\n",
+        );
+      }
       warnForStyleProps(nativeProps, this.viewConfig.validAttributes);
     }
 
@@ -322,10 +327,6 @@ export function shouldSetTextContent(type: string, props: Props): boolean {
 
 // The Fabric renderer is secondary to the existing React Native renderer.
 export const isPrimaryRenderer = false;
-export const now = ReactNativeFrameSchedulingNow;
-export const scheduleDeferredCallback = ReactNativeFrameSchedulingScheduleDeferredCallback;
-export const cancelDeferredCallback = ReactNativeFrameSchedulingCancelDeferredCallback;
-export const shouldYield = ReactNativeFrameSchedulingShouldYield;
 
 export const scheduleTimeout = setTimeout;
 export const cancelTimeout = clearTimeout;

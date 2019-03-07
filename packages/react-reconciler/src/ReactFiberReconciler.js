@@ -27,6 +27,7 @@ import {HostComponent, ClassComponent} from 'shared/ReactWorkTags';
 import getComponentName from 'shared/getComponentName';
 import invariant from 'shared/invariant';
 import warningWithoutStack from 'shared/warningWithoutStack';
+import ReactSharedInternals from 'shared/ReactSharedInternals';
 
 import {getPublicInstance} from './ReactFiberHostConfig';
 import {
@@ -340,6 +341,7 @@ export function findHostInstanceWithNoPortals(
   return hostFiber.stateNode;
 }
 
+let overrideHookState = null;
 let overrideProps = null;
 
 if (__DEV__) {
@@ -367,6 +369,38 @@ if (__DEV__) {
     return copyWithSetImpl(obj, path, 0, value);
   };
 
+  // Support DevTools editable values for useState and useReducer.
+  overrideHookState = (
+    fiber: Fiber,
+    id: number,
+    path: Array<string | number>,
+    value: any,
+  ) => {
+    // For now, the "id" of stateful hooks is just the stateful hook index.
+    // This may change in the future with e.g. nested hooks.
+    let currentHook = fiber.memoizedState;
+    while (currentHook !== null && id > 0) {
+      currentHook = currentHook.next;
+      id--;
+    }
+    if (currentHook !== null) {
+      flushPassiveEffects();
+
+      const newState = copyWithSet(currentHook.memoizedState, path, value);
+      currentHook.memoizedState = newState;
+      currentHook.baseState = newState;
+
+      // We aren't actually adding an update to the queue,
+      // because there is no update we can add for useReducer hooks that won't trigger an error.
+      // (There's no appropriate action type for DevTools overrides.)
+      // As a result though, React will see the scheduled update as a noop and bailout.
+      // Shallow cloning props works as a workaround for now to bypass the bailout check.
+      fiber.memoizedProps = {...fiber.memoizedProps};
+
+      scheduleWork(fiber, Sync);
+    }
+  };
+
   // Support DevTools props for function components, forwardRef, memo, host components, etc.
   overrideProps = (fiber: Fiber, path: Array<string | number>, value: any) => {
     flushPassiveEffects();
@@ -380,9 +414,13 @@ if (__DEV__) {
 
 export function injectIntoDevTools(devToolsConfig: DevToolsConfig): boolean {
   const {findFiberByHostInstance} = devToolsConfig;
+  const {ReactCurrentDispatcher} = ReactSharedInternals;
+
   return injectInternals({
     ...devToolsConfig,
+    overrideHookState,
     overrideProps,
+    currentDispatcherRef: ReactCurrentDispatcher,
     findHostInstanceByFiber(fiber: Fiber): Instance | TextInstance | null {
       const hostFiber = findCurrentHostFiber(fiber);
       if (hostFiber === null) {

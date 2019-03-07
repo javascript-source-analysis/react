@@ -12,10 +12,19 @@
 
 let React;
 let ReactFabric;
+let ReactFeatureFlags;
+let createReactClass;
 let createReactNativeComponentClass;
 let UIManager;
 let FabricUIManager;
 let StrictMode;
+let NativeMethodsMixin;
+
+const SET_NATIVE_PROPS_DEPRECATION_MESSAGE =
+  'Warning: Calling ref.setNativeProps(nativeProps) ' +
+  'is deprecated and will be removed in a future release. ' +
+  'Use the setNativeProps export from the react-native package instead.' +
+  "\n\timport {setNativeProps} from 'react-native';\n\tsetNativeProps(ref, nativeProps);\n";
 
 jest.mock('shared/ReactFeatureFlags', () =>
   require('shared/forks/ReactFeatureFlags.native-oss'),
@@ -27,11 +36,21 @@ describe('ReactFabric', () => {
 
     React = require('react');
     StrictMode = React.StrictMode;
+    ReactFeatureFlags = require('shared/ReactFeatureFlags');
+    ReactFeatureFlags.warnAboutDeprecatedSetNativeProps = true;
     ReactFabric = require('react-native-renderer/fabric');
     FabricUIManager = require('FabricUIManager');
     UIManager = require('UIManager');
+    createReactClass = require('create-react-class/factory')(
+      React.Component,
+      React.isValidElement,
+      new React.Component().updater,
+    );
     createReactNativeComponentClass = require('ReactNativeViewConfigRegistry')
       .register;
+    NativeMethodsMixin =
+      ReactFabric.__SECRET_INTERNALS_DO_NOT_USE_OR_YOU_WILL_BE_FIRED
+        .NativeMethodsMixin;
   });
 
   it('should be able to create and render a native component', () => {
@@ -157,7 +176,7 @@ describe('ReactFabric', () => {
     expect(FabricUIManager.__dumpHierarchyForJestTestsOnly()).toMatchSnapshot();
   });
 
-  it('should not call UIManager.updateView from setNativeProps for properties that have not changed', () => {
+  it('should not call UIManager.updateView from ref.setNativeProps for properties that have not changed', () => {
     const View = createReactNativeComponentClass('RCTView', () => ({
       validAttributes: {foo: true},
       uiViewClassName: 'RCTView',
@@ -169,7 +188,14 @@ describe('ReactFabric', () => {
       }
     }
 
-    [View, Subclass].forEach(Component => {
+    const CreateClass = createReactClass({
+      mixins: [NativeMethodsMixin],
+      render: () => {
+        return <View />;
+      },
+    });
+
+    [View, Subclass, CreateClass].forEach(Component => {
       UIManager.updateView.mockReset();
 
       let viewRef;
@@ -184,11 +210,109 @@ describe('ReactFabric', () => {
       );
       expect(UIManager.updateView).not.toBeCalled();
 
-      viewRef.setNativeProps({});
+      expect(() => {
+        viewRef.setNativeProps({});
+      }).toWarnDev([SET_NATIVE_PROPS_DEPRECATION_MESSAGE], {
+        withoutStack: true,
+      });
+
       expect(UIManager.updateView).not.toBeCalled();
 
-      viewRef.setNativeProps({foo: 'baz'});
+      expect(() => {
+        viewRef.setNativeProps({foo: 'baz'});
+      }).toWarnDev([SET_NATIVE_PROPS_DEPRECATION_MESSAGE], {
+        withoutStack: true,
+      });
       expect(UIManager.updateView).toHaveBeenCalledTimes(1);
+      expect(UIManager.updateView).toHaveBeenCalledWith(
+        expect.any(Number),
+        'RCTView',
+        {foo: 'baz'},
+      );
+    });
+  });
+
+  it('should be able to setNativeProps on native refs', () => {
+    const View = createReactNativeComponentClass('RCTView', () => ({
+      validAttributes: {foo: true},
+      uiViewClassName: 'RCTView',
+    }));
+
+    UIManager.updateView.mockReset();
+
+    let viewRef;
+    ReactFabric.render(
+      <View
+        foo="bar"
+        ref={ref => {
+          viewRef = ref;
+        }}
+      />,
+      11,
+    );
+
+    expect(UIManager.updateView).not.toBeCalled();
+    ReactFabric.setNativeProps(viewRef, {foo: 'baz'});
+    expect(UIManager.updateView).toHaveBeenCalledTimes(1);
+    expect(UIManager.updateView).toHaveBeenCalledWith(
+      expect.any(Number),
+      'RCTView',
+      {foo: 'baz'},
+    );
+  });
+
+  it('should warn and no-op if calling setNativeProps on non native refs', () => {
+    const View = createReactNativeComponentClass('RCTView', () => ({
+      validAttributes: {foo: true},
+      uiViewClassName: 'RCTView',
+    }));
+
+    class BasicClass extends React.Component {
+      render() {
+        return <React.Fragment />;
+      }
+    }
+
+    class Subclass extends ReactFabric.NativeComponent {
+      render() {
+        return <View />;
+      }
+    }
+
+    const CreateClass = createReactClass({
+      mixins: [NativeMethodsMixin],
+      render: () => {
+        return <View />;
+      },
+    });
+
+    [BasicClass, Subclass, CreateClass].forEach(Component => {
+      UIManager.updateView.mockReset();
+
+      let viewRef;
+      ReactFabric.render(
+        <Component
+          foo="bar"
+          ref={ref => {
+            viewRef = ref;
+          }}
+        />,
+        11,
+      );
+
+      expect(UIManager.updateView).not.toBeCalled();
+      expect(() => {
+        ReactFabric.setNativeProps(viewRef, {foo: 'baz'});
+      }).toWarnDev(
+        [
+          "Warning: setNativeProps was called with a ref that isn't a " +
+            'native component. Use React.forwardRef to get access ' +
+            'to the underlying native component',
+        ],
+        {withoutStack: true},
+      );
+
+      expect(UIManager.updateView).not.toBeCalled();
     });
   });
 

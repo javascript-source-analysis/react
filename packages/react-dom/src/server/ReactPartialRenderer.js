@@ -21,7 +21,6 @@ import describeComponentFrame from 'shared/describeComponentFrame';
 import ReactSharedInternals from 'shared/ReactSharedInternals';
 import {
   warnAboutDeprecatedLifecycles,
-  enableHooks,
   enableSuspenseServerRenderer,
 } from 'shared/ReactFeatureFlags';
 
@@ -55,7 +54,6 @@ import {
   prepareToUseHooks,
   finishHooks,
   Dispatcher,
-  DispatcherWithoutHooks,
   currentThreadID,
   setCurrentThreadID,
 } from './ReactPartialRendererHooks';
@@ -87,7 +85,7 @@ const toArray = ((React.Children.toArray: any): toArrayType);
 // Each stack is an array of frames which may contain nested stacks of elements.
 let currentDebugStacks = [];
 
-let ReactCurrentOwner = ReactSharedInternals.ReactCurrentOwner;
+let ReactCurrentDispatcher = ReactSharedInternals.ReactCurrentDispatcher;
 let ReactDebugCurrentFrame;
 let prevGetCurrentStackImpl = null;
 let getCurrentServerStackImpl = () => '';
@@ -717,6 +715,7 @@ class ReactDOMServerRenderer {
   destroy() {
     if (!this.exhausted) {
       this.exhausted = true;
+      this.clearProviders();
       freeThreadID(this.threadID);
     }
   }
@@ -778,6 +777,15 @@ class ReactDOMServerRenderer {
     context[this.threadID] = previousValue;
   }
 
+  clearProviders(): void {
+    // Restore any remaining providers on the stack to previous values
+    for (let index = this.contextIndex; index >= 0; index--) {
+      const context: ReactContext<any> = this.contextStack[index];
+      const previousValue = this.contextValueStack[index];
+      context[this.threadID] = previousValue;
+    }
+  }
+
   read(bytes: number): string | null {
     if (this.exhausted) {
       return null;
@@ -785,12 +793,8 @@ class ReactDOMServerRenderer {
 
     const prevThreadID = currentThreadID;
     setCurrentThreadID(this.threadID);
-    const prevDispatcher = ReactCurrentOwner.currentDispatcher;
-    if (enableHooks) {
-      ReactCurrentOwner.currentDispatcher = Dispatcher;
-    } else {
-      ReactCurrentOwner.currentDispatcher = DispatcherWithoutHooks;
-    }
+    const prevDispatcher = ReactCurrentDispatcher.current;
+    ReactCurrentDispatcher.current = Dispatcher;
     try {
       // Markup generated within <Suspense> ends up buffered until we know
       // nothing in that boundary suspended
@@ -831,6 +835,7 @@ class ReactDOMServerRenderer {
                 'suspense fallback not found, something is broken',
               );
               this.stack.push(fallbackFrame);
+              out[this.suspenseDepth] += '<!--$!-->';
               // Skip flushing output since we're switching to the fallback
               continue;
             } else {
@@ -870,7 +875,7 @@ class ReactDOMServerRenderer {
       }
       return out[0];
     } finally {
-      ReactCurrentOwner.currentDispatcher = prevDispatcher;
+      ReactCurrentDispatcher.current = prevDispatcher;
       setCurrentThreadID(prevThreadID);
     }
   }
@@ -962,9 +967,27 @@ class ReactDOMServerRenderer {
         }
         case REACT_SUSPENSE_TYPE: {
           if (enableSuspenseServerRenderer) {
-            const fallbackChildren = toArray(
-              ((nextChild: any): ReactElement).props.fallback,
-            );
+            const fallback = ((nextChild: any): ReactElement).props.fallback;
+            if (fallback === undefined) {
+              // If there is no fallback, then this just behaves as a fragment.
+              const nextChildren = toArray(
+                ((nextChild: any): ReactElement).props.children,
+              );
+              const frame: Frame = {
+                type: null,
+                domNamespace: parentNamespace,
+                children: nextChildren,
+                childIndex: 0,
+                context: context,
+                footer: '',
+              };
+              if (__DEV__) {
+                ((frame: any): FrameDev).debugElementStack = [];
+              }
+              this.stack.push(frame);
+              return '';
+            }
+            const fallbackChildren = toArray(fallback);
             const nextChildren = toArray(
               ((nextChild: any): ReactElement).props.children,
             );
@@ -974,8 +997,7 @@ class ReactDOMServerRenderer {
               children: fallbackChildren,
               childIndex: 0,
               context: context,
-              footer: '',
-              out: '',
+              footer: '<!--/$-->',
             };
             const frame: Frame = {
               fallbackFrame,
@@ -984,7 +1006,7 @@ class ReactDOMServerRenderer {
               children: nextChildren,
               childIndex: 0,
               context: context,
-              footer: '',
+              footer: '<!--/$-->',
             };
             if (__DEV__) {
               ((frame: any): FrameDev).debugElementStack = [];
@@ -992,7 +1014,7 @@ class ReactDOMServerRenderer {
             }
             this.stack.push(frame);
             this.suspenseDepth++;
-            return '';
+            return '<!--$-->';
           } else {
             invariant(false, 'ReactDOMServer does not yet support Suspense.');
           }

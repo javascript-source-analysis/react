@@ -30,6 +30,7 @@ import {
   ContextConsumer,
   Profiler,
   SuspenseComponent,
+  DehydratedSuspenseComponent,
   MemoComponent,
   SimpleMemoComponent,
   LazyComponent,
@@ -43,12 +44,14 @@ import {
   DidCapture,
   Update,
   Ref,
+  Deletion,
 } from 'shared/ReactSideEffectTags';
 import ReactSharedInternals from 'shared/ReactSharedInternals';
 import {
   debugRenderPhaseSideEffects,
   debugRenderPhaseSideEffectsForStrictMode,
   enableProfilerTimer,
+  enableSuspenseServerRenderer,
 } from 'shared/ReactFeatureFlags';
 import invariant from 'shared/invariant';
 import shallowEqual from 'shared/shallowEqual';
@@ -81,7 +84,11 @@ import {
 import {
   shouldSetTextContent,
   shouldDeprioritizeSubtree,
+  isSuspenseInstancePending,
+  isSuspenseInstanceFallback,
+  registerSuspenseInstanceRetry,
 } from './ReactFiberHostConfig';
+import type {SuspenseInstance} from './ReactFiberHostConfig';
 import {pushHostContext, pushHostContainer} from './ReactFiberHostContext';
 import {
   pushProvider,
@@ -90,7 +97,7 @@ import {
   prepareToReadContext,
   calculateChangedBits,
 } from './ReactFiberNewContext';
-import {prepareToUseHooks, finishHooks, resetHooks} from './ReactFiberHooks';
+import {resetHooks, renderWithHooks, bailoutHooks} from './ReactFiberHooks';
 import {stopProfilerTimerIfRunning} from './ReactProfilerTimer';
 import {
   getMaskedContext,
@@ -103,6 +110,7 @@ import {
 } from './ReactFiberContext';
 import {
   enterHydrationState,
+  reenterHydrationStateFromDehydratedSuspenseInstance,
   resetHydrationState,
   tryToClaimNextHydratableInstance,
 } from './ReactFiberHydrationContext';
@@ -125,8 +133,11 @@ import {
   createWorkInProgress,
   isSimpleFunctionComponent,
 } from './ReactFiber';
+import {retryTimedOutBoundary} from './ReactFiberScheduler';
 
 const ReactCurrentOwner = ReactSharedInternals.ReactCurrentOwner;
+
+let didReceiveUpdate: boolean = false;
 
 let didWarnAboutBadClass;
 let didWarnAboutContextTypeOnFunctionComponent;
@@ -214,6 +225,10 @@ function updateForwardRef(
   nextProps: any,
   renderExpirationTime: ExpirationTime,
 ) {
+  // TODO: current can be non-null here even if the component
+  // hasn't yet mounted. This happens after the first render suspends.
+  // We'll need to figure out if this is fine or can cause issues.
+
   if (__DEV__) {
     if (workInProgress.type !== workInProgress.elementType) {
       // Lazy component props can't be validated in createElement
@@ -237,16 +252,54 @@ function updateForwardRef(
   // The rest is a fork of updateFunctionComponent
   let nextChildren;
   prepareToReadContext(workInProgress, renderExpirationTime);
-  prepareToUseHooks(current, workInProgress, renderExpirationTime);
   if (__DEV__) {
     ReactCurrentOwner.current = workInProgress;
     setCurrentPhase('render');
-    nextChildren = render(nextProps, ref);
+    nextChildren = renderWithHooks(
+      current,
+      workInProgress,
+      render,
+      nextProps,
+      ref,
+      renderExpirationTime,
+    );
+    if (
+      debugRenderPhaseSideEffects ||
+      (debugRenderPhaseSideEffectsForStrictMode &&
+        workInProgress.mode & StrictMode)
+    ) {
+      // Only double-render components with Hooks
+      if (workInProgress.memoizedState !== null) {
+        nextChildren = renderWithHooks(
+          current,
+          workInProgress,
+          render,
+          nextProps,
+          ref,
+          renderExpirationTime,
+        );
+      }
+    }
     setCurrentPhase(null);
   } else {
-    nextChildren = render(nextProps, ref);
+    nextChildren = renderWithHooks(
+      current,
+      workInProgress,
+      render,
+      nextProps,
+      ref,
+      renderExpirationTime,
+    );
   }
-  nextChildren = finishHooks(render, nextProps, nextChildren, ref);
+
+  if (current !== null && !didReceiveUpdate) {
+    bailoutHooks(current, workInProgress, renderExpirationTime);
+    return bailoutOnAlreadyFinishedWork(
+      current,
+      workInProgress,
+      renderExpirationTime,
+    );
+  }
 
   // React DevTools reads this flag.
   workInProgress.effectTag |= PerformedWork;
@@ -371,6 +424,10 @@ function updateSimpleMemoComponent(
   updateExpirationTime,
   renderExpirationTime: ExpirationTime,
 ): null | Fiber {
+  // TODO: current can be non-null here even if the component
+  // hasn't yet mounted. This happens when the inner render suspends.
+  // We'll need to figure out if this is fine or can cause issues.
+
   if (__DEV__) {
     if (workInProgress.type !== workInProgress.elementType) {
       // Lazy component props can't be validated in createElement
@@ -395,17 +452,20 @@ function updateSimpleMemoComponent(
       // Inner propTypes will be validated in the function component path.
     }
   }
-  if (current !== null && updateExpirationTime < renderExpirationTime) {
+  if (current !== null) {
     const prevProps = current.memoizedProps;
     if (
       shallowEqual(prevProps, nextProps) &&
       current.ref === workInProgress.ref
     ) {
-      return bailoutOnAlreadyFinishedWork(
-        current,
-        workInProgress,
-        renderExpirationTime,
-      );
+      didReceiveUpdate = false;
+      if (updateExpirationTime < renderExpirationTime) {
+        return bailoutOnAlreadyFinishedWork(
+          current,
+          workInProgress,
+          renderExpirationTime,
+        );
+      }
     }
   }
   return updateFunctionComponent(
@@ -506,16 +566,54 @@ function updateFunctionComponent(
 
   let nextChildren;
   prepareToReadContext(workInProgress, renderExpirationTime);
-  prepareToUseHooks(current, workInProgress, renderExpirationTime);
   if (__DEV__) {
     ReactCurrentOwner.current = workInProgress;
     setCurrentPhase('render');
-    nextChildren = Component(nextProps, context);
+    nextChildren = renderWithHooks(
+      current,
+      workInProgress,
+      Component,
+      nextProps,
+      context,
+      renderExpirationTime,
+    );
+    if (
+      debugRenderPhaseSideEffects ||
+      (debugRenderPhaseSideEffectsForStrictMode &&
+        workInProgress.mode & StrictMode)
+    ) {
+      // Only double-render components with Hooks
+      if (workInProgress.memoizedState !== null) {
+        nextChildren = renderWithHooks(
+          current,
+          workInProgress,
+          Component,
+          nextProps,
+          context,
+          renderExpirationTime,
+        );
+      }
+    }
     setCurrentPhase(null);
   } else {
-    nextChildren = Component(nextProps, context);
+    nextChildren = renderWithHooks(
+      current,
+      workInProgress,
+      Component,
+      nextProps,
+      context,
+      renderExpirationTime,
+    );
   }
-  nextChildren = finishHooks(Component, nextProps, nextChildren, context);
+
+  if (current !== null && !didReceiveUpdate) {
+    bailoutHooks(current, workInProgress, renderExpirationTime);
+    return bailoutOnAlreadyFinishedWork(
+      current,
+      workInProgress,
+      renderExpirationTime,
+    );
+  }
 
   // React DevTools reads this flag.
   workInProgress.effectTag |= PerformedWork;
@@ -850,7 +948,7 @@ function updateHostComponent(current, workInProgress, renderExpirationTime) {
     shouldDeprioritizeSubtree(type, nextProps)
   ) {
     // Schedule this fiber to re-render at offscreen priority. Then bailout.
-    workInProgress.expirationTime = Never;
+    workInProgress.expirationTime = workInProgress.childExpirationTime = Never;
     return null;
   }
 
@@ -903,6 +1001,9 @@ function mountLazyComponent(
   let child;
   switch (resolvedTag) {
     case FunctionComponent: {
+      if (__DEV__) {
+        validateFunctionComponentInDev(workInProgress, Component);
+      }
       child = updateFunctionComponent(
         null,
         workInProgress,
@@ -1063,7 +1164,6 @@ function mountIndeterminateComponent(
   const context = getMaskedContext(workInProgress, unmaskedContext);
 
   prepareToReadContext(workInProgress, renderExpirationTime);
-  prepareToUseHooks(null, workInProgress, renderExpirationTime);
 
   let value;
 
@@ -1091,9 +1191,23 @@ function mountIndeterminateComponent(
     }
 
     ReactCurrentOwner.current = workInProgress;
-    value = Component(props, context);
+    value = renderWithHooks(
+      null,
+      workInProgress,
+      Component,
+      props,
+      context,
+      renderExpirationTime,
+    );
   } else {
-    value = Component(props, context);
+    value = renderWithHooks(
+      null,
+      workInProgress,
+      Component,
+      props,
+      context,
+      renderExpirationTime,
+    );
   }
   // React DevTools reads this flag.
   workInProgress.effectTag |= PerformedWork;
@@ -1147,7 +1261,25 @@ function mountIndeterminateComponent(
   } else {
     // Proceed under the assumption that this is a function component
     workInProgress.tag = FunctionComponent;
-    value = finishHooks(Component, props, value, context);
+    if (__DEV__) {
+      if (
+        debugRenderPhaseSideEffects ||
+        (debugRenderPhaseSideEffectsForStrictMode &&
+          workInProgress.mode & StrictMode)
+      ) {
+        // Only double-render components with Hooks
+        if (workInProgress.memoizedState !== null) {
+          value = renderWithHooks(
+            null,
+            workInProgress,
+            Component,
+            props,
+            context,
+            renderExpirationTime,
+          );
+        }
+      }
+    }
     reconcileChildren(null, workInProgress, value, renderExpirationTime);
     if (__DEV__) {
       validateFunctionComponentInDev(workInProgress, Component);
@@ -1181,7 +1313,8 @@ function validateFunctionComponentInDev(workInProgress: Fiber, Component: any) {
       warning(
         false,
         'Function components cannot be given refs. ' +
-          'Attempts to access this ref will fail.%s',
+          'Attempts to access this ref will fail. ' +
+          'Did you mean to use React.forwardRef()?%s',
         info,
       );
     }
@@ -1276,6 +1409,22 @@ function updateSuspenseComponent(
   // children -- we skip over the primary children entirely.
   let next;
   if (current === null) {
+    if (enableSuspenseServerRenderer) {
+      // If we're currently hydrating, try to hydrate this boundary.
+      // But only if this has a fallback.
+      if (nextProps.fallback !== undefined) {
+        tryToClaimNextHydratableInstance(workInProgress);
+        // This could've changed the tag if this was a dehydrated suspense component.
+        if (workInProgress.tag === DehydratedSuspenseComponent) {
+          return updateDehydratedSuspenseComponent(
+            null,
+            workInProgress,
+            renderExpirationTime,
+          );
+        }
+      }
+    }
+
     // This is the initial mount. This branch is pretty simple because there's
     // no previous state that needs to be preserved.
     if (nextDidTimeout) {
@@ -1482,6 +1631,106 @@ function updateSuspenseComponent(
   return next;
 }
 
+function updateDehydratedSuspenseComponent(
+  current: Fiber | null,
+  workInProgress: Fiber,
+  renderExpirationTime: ExpirationTime,
+) {
+  if (current === null) {
+    // During the first pass, we'll bail out and not drill into the children.
+    // Instead, we'll leave the content in place and try to hydrate it later.
+    workInProgress.expirationTime = Never;
+    return null;
+  }
+  if ((workInProgress.effectTag & DidCapture) !== NoEffect) {
+    // Something suspended. Leave the existing children in place.
+    // TODO: In non-concurrent mode, should we commit the nodes we have hydrated so far?
+    workInProgress.child = null;
+    return null;
+  }
+  // We use childExpirationTime to indicate that a child might depend on context, so if
+  // any context has changed, we need to treat is as if the input might have changed.
+  const hasContextChanged = current.childExpirationTime >= renderExpirationTime;
+  const suspenseInstance = (current.stateNode: SuspenseInstance);
+  if (
+    didReceiveUpdate ||
+    hasContextChanged ||
+    isSuspenseInstanceFallback(suspenseInstance)
+  ) {
+    // This boundary has changed since the first render. This means that we are now unable to
+    // hydrate it. We might still be able to hydrate it using an earlier expiration time but
+    // during this render we can't. Instead, we're going to delete the whole subtree and
+    // instead inject a new real Suspense boundary to take its place, which may render content
+    // or fallback. The real Suspense boundary will suspend for a while so we have some time
+    // to ensure it can produce real content, but all state and pending events will be lost.
+
+    // Alternatively, this boundary is in a permanent fallback state. In this case, we'll never
+    // get an update and we'll never be able to hydrate the final content. Let's just try the
+    // client side render instead.
+
+    // Detach from the current dehydrated boundary.
+    current.alternate = null;
+    workInProgress.alternate = null;
+
+    // Insert a deletion in the effect list.
+    let returnFiber = workInProgress.return;
+    invariant(
+      returnFiber !== null,
+      'Suspense boundaries are never on the root. ' +
+        'This is probably a bug in React.',
+    );
+    const last = returnFiber.lastEffect;
+    if (last !== null) {
+      last.nextEffect = current;
+      returnFiber.lastEffect = current;
+    } else {
+      returnFiber.firstEffect = returnFiber.lastEffect = current;
+    }
+    current.nextEffect = null;
+    current.effectTag = Deletion;
+
+    // Upgrade this work in progress to a real Suspense component.
+    workInProgress.tag = SuspenseComponent;
+    workInProgress.stateNode = null;
+    workInProgress.memoizedState = null;
+    // This is now an insertion.
+    workInProgress.effectTag |= Placement;
+    // Retry as a real Suspense component.
+    return updateSuspenseComponent(null, workInProgress, renderExpirationTime);
+  } else if (isSuspenseInstancePending(suspenseInstance)) {
+    // This component is still pending more data from the server, so we can't hydrate its
+    // content. We treat it as if this component suspended itself. It might seem as if
+    // we could just try to render it client-side instead. However, this will perform a
+    // lot of unnecessary work and is unlikely to complete since it often will suspend
+    // on missing data anyway. Additionally, the server might be able to render more
+    // than we can on the client yet. In that case we'd end up with more fallback states
+    // on the client than if we just leave it alone. If the server times out or errors
+    // these should update this boundary to the permanent Fallback state instead.
+    // Mark it as having captured (i.e. suspended).
+    workInProgress.effectTag |= DidCapture;
+    // Leave the children in place. I.e. empty.
+    workInProgress.child = null;
+    // Register a callback to retry this boundary once the server has sent the result.
+    registerSuspenseInstanceRetry(
+      suspenseInstance,
+      retryTimedOutBoundary.bind(null, current),
+    );
+    return null;
+  } else {
+    // This is the first attempt.
+    reenterHydrationStateFromDehydratedSuspenseInstance(workInProgress);
+    const nextProps = workInProgress.pendingProps;
+    const nextChildren = nextProps.children;
+    workInProgress.child = mountChildFibers(
+      workInProgress,
+      null,
+      nextChildren,
+      renderExpirationTime,
+    );
+    return workInProgress.child;
+  }
+}
+
 function updatePortalComponent(
   current: Fiber | null,
   workInProgress: Fiber,
@@ -1638,6 +1887,10 @@ function updateContextConsumer(
   return workInProgress.child;
 }
 
+export function markWorkInProgressReceivedUpdate() {
+  didReceiveUpdate = true;
+}
+
 function bailoutOnAlreadyFinishedWork(
   current: Fiber | null,
   workInProgress: Fiber,
@@ -1647,7 +1900,7 @@ function bailoutOnAlreadyFinishedWork(
 
   if (current !== null) {
     // Reuse previous context list
-    workInProgress.firstContextDependency = current.firstContextDependency;
+    workInProgress.contextDependencies = current.contextDependencies;
   }
 
   if (enableProfilerTimer) {
@@ -1680,11 +1933,13 @@ function beginWork(
   if (current !== null) {
     const oldProps = current.memoizedProps;
     const newProps = workInProgress.pendingProps;
-    if (
-      oldProps === newProps &&
-      !hasLegacyContextChanged() &&
-      updateExpirationTime < renderExpirationTime
-    ) {
+
+    if (oldProps !== newProps || hasLegacyContextChanged()) {
+      // If props or context changed, mark the fiber as having performed work.
+      // This may be unset if the props are determined to be equal later (memo).
+      didReceiveUpdate = true;
+    } else if (updateExpirationTime < renderExpirationTime) {
+      didReceiveUpdate = false;
       // This fiber does not have any pending work. Bailout without entering
       // the begin phase. There's still some bookkeeping we that needs to be done
       // in this optimized path, mostly pushing stuff onto the stack.
@@ -1760,6 +2015,15 @@ function beginWork(
           }
           break;
         }
+        case DehydratedSuspenseComponent: {
+          if (enableSuspenseServerRenderer) {
+            // We know that this component will suspend again because if it has
+            // been unsuspended it has committed as a regular Suspense component.
+            // If it needs to be retried, it should have work scheduled on it.
+            workInProgress.effectTag |= DidCapture;
+            break;
+          }
+        }
       }
       return bailoutOnAlreadyFinishedWork(
         current,
@@ -1767,6 +2031,8 @@ function beginWork(
         renderExpirationTime,
       );
     }
+  } else {
+    didReceiveUpdate = false;
   }
 
   // Before entering the begin phase, clear the expiration time.
@@ -1927,13 +2193,22 @@ function beginWork(
         renderExpirationTime,
       );
     }
-    default:
-      invariant(
-        false,
-        'Unknown unit of work tag. This error is likely caused by a bug in ' +
-          'React. Please file an issue.',
-      );
+    case DehydratedSuspenseComponent: {
+      if (enableSuspenseServerRenderer) {
+        return updateDehydratedSuspenseComponent(
+          current,
+          workInProgress,
+          renderExpirationTime,
+        );
+      }
+      break;
+    }
   }
+  invariant(
+    false,
+    'Unknown unit of work tag. This error is likely caused by a bug in ' +
+      'React. Please file an issue.',
+  );
 }
 
 export {beginWork};

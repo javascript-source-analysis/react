@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2013-present, Facebook, Inc.
+ * Copyright (c) Facebook, Inc. and its affiliates.
  *
  * This source code is licensed under the MIT license found in the
  * LICENSE file in the root directory of this source tree.
@@ -9,23 +9,24 @@
 
 'use strict';
 
-let ReactFeatureFlags;
 let React;
 let ReactDOM;
 let Suspense;
 let ReactCache;
+let ReactTestUtils;
 let TextResource;
+let act;
 
 describe('ReactDOMSuspensePlaceholder', () => {
   let container;
 
   beforeEach(() => {
     jest.resetModules();
-    ReactFeatureFlags = require('shared/ReactFeatureFlags');
-    ReactFeatureFlags.enableHooks = true;
     React = require('react');
     ReactDOM = require('react-dom');
     ReactCache = require('react-cache');
+    ReactTestUtils = require('react-dom/test-utils');
+    act = ReactTestUtils.act;
     Suspense = React.Suspense;
     container = document.createElement('div');
     document.body.appendChild(container);
@@ -145,12 +146,14 @@ describe('ReactDOMSuspensePlaceholder', () => {
         );
       }
 
-      ReactDOM.render(<App />, container);
+      act(() => {
+        ReactDOM.render(<App />, container);
+      });
       expect(container.innerHTML).toEqual(
         '<span style="display: none;">Sibling</span><span style="display: none;"></span>Loading...',
       );
 
-      setIsVisible(true);
+      act(() => setIsVisible(true));
       expect(container.innerHTML).toEqual(
         '<span style="display: none;">Sibling</span><span style="display: none;"></span>Loading...',
       );
